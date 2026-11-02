@@ -25,7 +25,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 STATE = Path(os.environ.get("UPDATE_ALERT_STATE", Path.home() / ".update-alert.json"))
-ENV_FILE = Path(os.environ.get("UPDATE_ALERT_ENV", Path.home() / "main/homeassistant-watchdog/.env"))
+ENV_FILE = Path(os.environ.get("UPDATE_ALERT_ENV", Path.home() / "main/home-watchdog/.env"))
 REPORT_COMMAND = ["ssh", "-T", "-i", str(Path.home() / ".ssh/update-alert"), "-o", "BatchMode=yes", "root@192.168.1.2"]
 
 KEV_URL = "https://raw.githubusercontent.com/cisagov/kev-data/main/known_exploited_vulnerabilities.json"
