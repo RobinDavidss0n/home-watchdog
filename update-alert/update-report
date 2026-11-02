@@ -1,0 +1,13 @@
+#!/bin/sh
+# On the Proxmox host: what's installed and pending, for update_alert.py on VM 101.
+# That VM's key runs this and nothing else (a forced command in authorized_keys).
+# Changes nothing; pve-daily-update keeps the package lists fresh.
+. /etc/os-release
+echo "RELEASE $VERSION_CODENAME"
+echo "KERNEL $(uname -r)"
+dpkg-query -W -f 'INSTALLED ${Package} ${Version}\n'
+
+apt list --upgradable 2>/dev/null | sed -n 's/^\([^/]*\)\/[^ ]* \([^ ]*\) [^ ]* \[upgradable from: \(.*\)\]$/\1 \2 \3/p' |
+while read -r package new old; do
+  echo "PENDING $package $old $new $(dpkg-query -W -f '${source:Package}' "$package" | head -1)"
+done

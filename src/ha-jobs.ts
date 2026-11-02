@@ -1,5 +1,6 @@
 import { env, getProxmoxAuthHeader } from "./env.js";
 import { logger } from "./logger.js";
+import { JobsState } from "./recovery.js";
 
 const module = "HA Jobs";
 
@@ -61,7 +62,46 @@ const executeGuestCommand = async (command: string[]): Promise<string> => {
   throw new Error("Guest agent command timed out");
 };
 
-export const hasActiveJobs = async (): Promise<boolean> => {
+export const parseActiveJobs = (output: string): Record<string, string>[] => {
+
+  const lines = output.split("\n");
+  const activeJobs: Record<string, string>[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    
+    if (lines[i].includes("done: false")) {
+
+      const indentMatch = lines[i].match(/^\s*/);
+      const indent = indentMatch ? indentMatch[0].length : 0;
+      const jobData: Record<string, string> = {};
+
+      const extract = (line: string) => {
+        const match = line.match(new RegExp(`^ {${indent}}([a-z_]+):\\s*(.*)$`));
+        if (match) jobData[match[1]] = match[2].replace(/^"|"$/g, "");
+      };
+
+      // Scan backwards for keys belonging to this job block
+      for (let j = i; j >= 0; j--) {
+        const currIndent = lines[j].match(/^\s*/)?.[0].length || 0;
+        if (currIndent < indent && lines[j].trim() !== "") break;
+        if (currIndent === indent) extract(lines[j]);
+      }
+
+      // Scan forwards for keys belonging to this job block
+      for (let j = i + 1; j < lines.length; j++) {
+        const currIndent = lines[j].match(/^\s*/)?.[0].length || 0;
+        if (currIndent < indent && lines[j].trim() !== "") break;
+        if (currIndent === indent) extract(lines[j]);
+      }
+
+      activeJobs.push(jobData);
+    }
+  }
+
+  return activeJobs;
+};
+
+export const getJobsState = async (): Promise<JobsState> => {
 
   try {
     logger.info(module, "Checking Supervisor for active jobs via QEMU guest agent");
@@ -69,59 +109,27 @@ export const hasActiveJobs = async (): Promise<boolean> => {
     const output = await executeGuestCommand(["ha", "jobs", "info"]);
     
     if (!output) {
-      logger.error(module, "Guest agent returned empty output. Assuming active jobs to prevent unsafe restart.");
-      return true;
+      logger.error(module, "Guest agent returned empty output, job state unknown.");
+      return "unknown";
     }
 
-    const lines = output.split("\n");
-    const activeJobs: Record<string, string>[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      
-      if (lines[i].includes("done: false")) {
-
-        const indentMatch = lines[i].match(/^\s*/);
-        const indent = indentMatch ? indentMatch[0].length : 0;
-        const jobData: Record<string, string> = {};
-
-        const extract = (line: string) => {
-          const match = line.match(new RegExp(`^ {${indent}}([a-z_]+):\\s*(.*)$`));
-          if (match) jobData[match[1]] = match[2].replace(/^"|"$/g, "");
-        };
-
-        // Scan backwards for keys belonging to this job block
-        for (let j = i; j >= 0; j--) {
-          const currIndent = lines[j].match(/^\s*/)?.[0].length || 0;
-          if (currIndent < indent && lines[j].trim() !== "") break;
-          if (currIndent === indent) extract(lines[j]);
-        }
-
-        // Scan forwards for keys belonging to this job block
-        for (let j = i + 1; j < lines.length; j++) {
-          const currIndent = lines[j].match(/^\s*/)?.[0].length || 0;
-          if (currIndent < indent && lines[j].trim() !== "") break;
-          if (currIndent === indent) extract(lines[j]);
-        }
-
-        activeJobs.push(jobData);
-      }
-    }
+    const activeJobs = parseActiveJobs(output);
 
     if (activeJobs.length > 0) {
       logger.info(module, `Supervisor reported ${activeJobs.length} active job(s)`);
       console.log("Active jobs:", activeJobs);
-    } else {
-      logger.info(module, "Supervisor reported 0 active jobs");
+      return "busy";
     }
 
-    return activeJobs.length > 0;
+    logger.info(module, "Supervisor reported 0 active jobs");
+    return "idle";
 
   } catch (error) {
 
     logger.error(module, 
-      "Failed to check HA active jobs. Assuming active to prevent unsafe restart.", 
+      "Failed to check HA active jobs, job state unknown.", 
       error instanceof Error ? error.stack || error.message : error
     );
-    return true;
+    return "unknown";
   }
 };

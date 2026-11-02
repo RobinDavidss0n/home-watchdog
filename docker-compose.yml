@@ -12,6 +12,8 @@ services:
     mem_limit: 1g
     tmpfs:
       - /tmp
+    volumes:
+      - ./screenshots:/ha-watchdog
 
   # Development
   dev:

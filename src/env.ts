@@ -21,11 +21,18 @@ export const env = {
   REINIT_BROWSER_LOOPS_TIME_HOURS:  12,
   WAIT_AFTER_JOB_DETECTED_MINUTES:  2,
   WAIT_AFTER_RESTART_MINUTES:       5,
+  /** How long into an outage active jobs may keep deferring a restart */
+  BUSY_JOBS_MAX_DEFER_MINUTES:      60,
+  /** Same for an unreachable guest agent, which is normal while HA reboots or updates */
+  UNKNOWN_JOBS_MAX_DEFER_MINUTES:   10,
+  HEARTBEAT_MINUTES:                60,
 
   // Debugging options
   LOG_HA_JOBS_OUTPUT:               false,
   /** Only run one time then stops */
   DEMO_RUN:                         false,
+  /** Fail this many health checks after start, to run the whole recovery for real */
+  SIMULATE_UI_FAILS:                Number(process.env.SIMULATE_UI_FAILS ?? 0),
 
   // Dynamically auto set
   REINIT_BROWSER_LOOPS:             null,
@@ -39,6 +46,8 @@ if(env.NODE_ENV === "development") {
   env.REINIT_BROWSER_LOOPS_TIME_HOURS =  0.01;
   env.WAIT_AFTER_JOB_DETECTED_MINUTES =  0.25;
   env.WAIT_AFTER_RESTART_MINUTES =       1;
+  env.BUSY_JOBS_MAX_DEFER_MINUTES =      1;
+  env.UNKNOWN_JOBS_MAX_DEFER_MINUTES =   0.5;
 }
 
 // Dynamically calculated based on the set REINIT_BROWSER_LOOPS_TIME_HOURS

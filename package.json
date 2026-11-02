@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "test": "node --import tsx --test test/*.test.ts",
+    "test:integration": "node --import tsx --test test/integration/*.test.ts",
     "start": "node dist/main.js",
     "dev": "docker compose --profile dev up --build --watch --force-recreate --remove-orphans dev"
   },
