@@ -43,7 +43,7 @@ NO_LOGIN_WORDS = ("unauthenticated", "without authentication", "authentication b
 
 
 def fetch(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "update-alert (home server)"})
+    request = urllib.request.Request(url, headers={"User-Agent": "update-alert/1.0"})  # NVD's Cloudflare refuses some
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read().decode("utf-8")
 
@@ -122,14 +122,14 @@ def parse_proxmox_advisories(page: str) -> list:
             continue
 
         fixed_part = text.split("Fixed in:", 1)[-1] if "Fixed in:" in text else ""
-        fixed_part = fixed_part.split("References:", 1)[0]
+        fixed_part = re.split(r"References:|Details:", fixed_part)[0]
 
         advisories.append({
             "id": subject.group(1),
             "title": subject.group(2).replace("​", "").strip(),
             "cves": sorted(set(re.findall(r"CVE-\d{4}-\d+", text))),
             "no_login": any(word in text.lower() for word in NO_LOGIN_WORDS),
-            "fixed": re.findall(r"([a-z0-9][a-z0-9.+-]*?)(?:\(-signed\))?\s*>=\s*([\w.:+~-]+)", fixed_part),
+            "fixed": re.findall(r"([a-z0-9][a-z0-9.+-]*)(?:\(-signed\))?(?:\s*>=\s*|\s+)(\d[\w.:+~-]*)", fixed_part),
             "kernels": re.findall(r"proxmox-kernel-(\d[\w.]*-\d+)-pve", fixed_part),
         })
 

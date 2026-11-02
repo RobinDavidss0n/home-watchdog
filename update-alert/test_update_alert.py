@@ -100,6 +100,17 @@ class ParseTests(unittest.TestCase):
         self.assertEqual([a["id"] for a in parse_proxmox_advisories(PAGE)],
                          ["PSA-2026-00080-1", "PSA-2026-00079-1", "PSA-2026-00081-1"])
 
+    def test_proxmox_advisory_fix_written_in_words(self):
+        page = ('<article><div class="bbWrapper"><b>Subject</b>: PSA-2026-00043-1: Authentication bypass<br />'
+                '<b>Fixed in</b>: libpve-access-control 8.0.4 (released 2023-07-20) and all later versions. '
+                'No supported Proxmox VE release is affected.<br /><b>Details</b>: pam 2 retries.</div></article>')
+        advisory = parse_proxmox_advisories(page)[0]
+        report = host()
+        report["installed"]["libpve-access-control"] = "9.0.1"
+
+        self.assertEqual(advisory["fixed"], [("libpve-access-control", "8.0.4")])
+        self.assertFalse(advisory_is_open(advisory, report))
+
     def test_proxmox_advisory_fields(self):
         kernel, shell, auth = parse_proxmox_advisories(PAGE)
 
