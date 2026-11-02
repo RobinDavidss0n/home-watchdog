@@ -1,9 +1,15 @@
+import json
+import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
+from pathlib import Path
+from unittest.mock import patch
 
-from update_alert import (advisory_is_open, find_problems, format_message, is_new_release,
+from update_alert import (DSA_URL, KEV_URL, MAX_LINES, PSA_URL, advisory_is_open, check, find_problems,
+                          format_message, is_new_release, latest_proxmox_advisories, load_state, main,
                           parse_debian_advisories, parse_proxmox_advisories, parse_report,
-                          pending_debian_advisories, to_tell, wanted_scores, why_serious)
+                          pending_debian_advisories, read_env, save_state, to_tell, wanted_scores,
+                          why_serious)
 
 REPORT = """RELEASE trixie
 KERNEL 7.0.14-26-pve
@@ -50,6 +56,9 @@ PAGE = """
 <article><div class="bbWrapper">Thanks for the fix!</div></article>
 """
 
+KEV_LIST = json.dumps({"vulnerabilities": [{"cveID": "CVE-2026-2222"}]})
+TODAY = date(2026, 11, 2)
+
 
 def host():
     return parse_report(REPORT)
@@ -57,6 +66,14 @@ def host():
 
 def debian():
     return pending_debian_advisories(parse_debian_advisories(DSA_LIST, "trixie"), host())
+
+
+def post(text):
+    return f'<article><div class="bbWrapper">{text}</div></article>'
+
+
+def advisory_post(number):
+    return post(f"<b>Subject</b>: PSA-2026-{number:05}-1: Something")
 
 
 class ParseTests(unittest.TestCase):
@@ -173,6 +190,14 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(wanted_scores(debian(), [kernel], {"CVE-2026-4444": {}}, {"CVE-2026-98432"}), [])
 
 
+class EnvTests(unittest.TestCase):
+
+    def test_read_env_handles_quotes_comments_and_equals_signs(self):
+        env = read_env('# a comment\nHA_TOKEN="abc=def"\nPROXMOX_TOKEN=\'x\'\n\nPLAIN=y\n')
+
+        self.assertEqual(env, {"HA_TOKEN": "abc=def", "PROXMOX_TOKEN": "x", "PLAIN": "y"})
+
+
 class TellTests(unittest.TestCase):
 
     def test_new_then_quiet_then_reminder(self):
@@ -187,6 +212,250 @@ class TellTests(unittest.TestCase):
 
         self.assertEqual(len(message.splitlines()), 6)
         self.assertTrue(message.endswith("and 3 more"))
+
+
+class SourceTests(unittest.TestCase):
+
+    def advisories(self, pages):
+        with patch("update_alert.fetch", side_effect=pages.__getitem__) as fetch:
+            ids = [advisory["id"] for advisory in latest_proxmox_advisories()]
+
+        self.fetched = [call.args[0] for call in fetch.call_args_list]
+        return ids
+
+    def test_one_page_is_read_once(self):
+        self.assertEqual(self.advisories({PSA_URL: advisory_post(1)}), ["PSA-2026-00001-1"])
+        self.assertEqual(self.fetched, [PSA_URL])
+
+    def test_two_pages_are_both_read(self):
+        pages = {PSA_URL: '<a href="page-2">2</a>' + advisory_post(1), f"{PSA_URL}page-2": advisory_post(2)}
+
+        self.assertEqual(self.advisories(pages), ["PSA-2026-00001-1", "PSA-2026-00002-1"])
+        self.assertEqual(self.fetched, [PSA_URL, f"{PSA_URL}page-2"])
+
+    def test_only_the_last_two_of_many_pages_are_read(self):
+        pages = {PSA_URL: '<a href="page-2">2</a><a href="page-3">3</a>' + advisory_post(1),
+                 f"{PSA_URL}page-2": advisory_post(2),
+                 f"{PSA_URL}page-3": advisory_post(3)}
+
+        self.assertEqual(self.advisories(pages), ["PSA-2026-00002-1", "PSA-2026-00003-1"])
+
+    def test_a_page_without_posts_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.advisories({PSA_URL: "<html>Oops, something went wrong</html>"})
+
+        with self.assertRaises(RuntimeError):
+            self.advisories({PSA_URL: '<a href="page-2">2</a>' + advisory_post(1), f"{PSA_URL}page-2": "<html></html>"})
+
+    def test_a_last_page_of_replies_only_does_not_raise(self):
+        pages = {PSA_URL: '<a href="page-2">2</a>' + advisory_post(1), f"{PSA_URL}page-2": post("Thanks!")}
+
+        self.assertEqual(self.advisories(pages), ["PSA-2026-00001-1"])
+
+    def test_a_debian_list_with_nothing_for_the_release_raises(self):
+        with self.assertRaises(RuntimeError):
+            parse_debian_advisories(DSA_LIST, "forky")
+
+
+class OfflineTests(unittest.TestCase):
+    """A temporary state file, with the host, the web and the phone replaced."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+        self.state_file = self.folder / "state.json"
+        self.pages = {KEV_URL: KEV_LIST, DSA_URL: DSA_LIST, PSA_URL: PAGE}
+        self.down = set()
+
+        self.replace("update_alert.STATE", new=self.state_file)
+        self.replace("update_alert.fetch", side_effect=self.fetch)
+        self.read_host = self.replace("update_alert.read_host", return_value=host())
+        self.lookup = self.replace("update_alert.lookup_cvss", return_value=None)
+        self.notify = self.replace("update_alert.notify")
+        self.replace("builtins.print")
+
+    def replace(self, target, **kwargs):
+        patcher = patch(target, **kwargs)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def fetch(self, url):
+        if url in self.down:
+            raise OSError(f"{url} is down")
+
+        return self.pages[url]
+
+    def saved(self):
+        return json.loads(self.state_file.read_text())
+
+
+class CheckTests(OfflineTests):
+
+    def test_all_sources_read_tells_and_prunes(self):
+        state = {**load_state(), "told": {"DSA-1-1": "2026-11-01"}}
+
+        check(state, TODAY)
+
+        self.assertEqual(state["told"], {"DSA-6600-1": "2026-11-02", "PSA-2026-00081-1": "2026-11-02"})
+
+    def test_a_failed_forum_still_tells_then_raises_without_pruning(self):
+        self.down.add(PSA_URL)
+        state = {**load_state(), "told": {"PSA-2026-00081-1": "2026-11-01"}}
+
+        with self.assertRaisesRegex(RuntimeError, "forum"):
+            check(state, TODAY)
+
+        self.notify.assert_called_once()
+        self.assertIn("CVE-2026-2222", self.notify.call_args.args[0])
+        self.assertEqual(state["told"], {"PSA-2026-00081-1": "2026-11-01", "DSA-6600-1": "2026-11-02"})
+
+    def test_the_exploited_list_and_the_debian_list_fail_on_their_own(self):
+        for url, name in ((KEV_URL, "exploited"), (DSA_URL, "Debian")):
+            with self.subTest(name):
+                self.down = {url}
+                state = load_state()
+
+                with self.assertRaisesRegex(RuntimeError, name):
+                    check(state, TODAY)
+
+                self.assertEqual(list(state["told"]), ["PSA-2026-00081-1"])
+
+    def test_nvd_failing_for_one_cve_stops_neither_the_next_cve_nor_the_alert(self):
+        def lookup(cve):
+            if cve == "CVE-2026-0001":
+                raise OSError("NVD is down")
+
+            return {"score": 5.0, "vector": "LOCAL"}
+
+        self.lookup.side_effect = lookup
+        self.pages[PSA_URL] = post("<b>Subject</b>: PSA-2026-00082-1: Something (CVE-2026-0001)")
+        state = load_state()
+
+        with self.assertRaisesRegex(RuntimeError, "CVE-2026-0001"):
+            check(state, TODAY)
+
+        self.assertIn("CVE-2026-2222", self.notify.call_args.args[0])
+        self.assertIn("DSA-6600-1", state["told"])
+        self.assertEqual(list(state["scores"]), ["CVE-2026-4444"])
+
+    def test_only_what_the_message_shows_is_marked_told(self):
+        problems = {f"key-{i}": f"line {i}" for i in range(MAX_LINES + 2)}
+        state = load_state()
+
+        with patch("update_alert.find_problems", return_value=problems):
+            check(state, TODAY)
+            self.assertEqual(sorted(state["told"]), [f"key-{i}" for i in range(MAX_LINES)])
+
+            check(state, TODAY + timedelta(days=1))
+
+        self.assertIn(f"line {MAX_LINES}", self.notify.call_args.args[0])
+        self.assertEqual(len(state["told"]), MAX_LINES + 2)
+
+
+class MainTests(OfflineTests):
+    """Day 0 is the first failure; a day's number is how many days the check has failed for."""
+
+    def setUp(self):
+        super().setUp()
+        self.read_host.side_effect = OSError("no route to host")
+
+    def run_on_day(self, day):
+        return main(TODAY + timedelta(days=day))
+
+    def test_quiet_until_day_3_then_tells_once(self):
+        for day in range(3):
+            self.assertEqual(self.run_on_day(day), 1)
+
+        self.notify.assert_not_called()
+
+        self.run_on_day(3)
+        self.run_on_day(4)
+
+        self.notify.assert_called_once()
+        self.assertIn("3 days: no route to host", self.notify.call_args.args[0])
+        self.assertEqual(self.saved()["failed_since"], "2026-11-02")
+
+    def test_a_gap_over_day_3_still_tells(self):
+        self.run_on_day(0)
+        self.run_on_day(2)
+        self.notify.assert_not_called()
+
+        self.run_on_day(4)
+
+        self.notify.assert_called_once()
+        self.assertIn("4 days", self.notify.call_args.args[0])
+
+    def test_a_failing_notify_keeps_state_and_retries(self):
+        self.run_on_day(0)
+        self.notify.side_effect = OSError("Home Assistant is down")
+
+        self.assertEqual(self.run_on_day(3), 1)
+        self.assertEqual(self.saved()["failed_since"], "2026-11-02")
+        self.assertFalse(self.saved()["failure_told"])
+
+        self.notify.side_effect = None
+        self.run_on_day(4)
+        self.assertTrue(self.saved()["failure_told"])
+        self.assertEqual(self.notify.call_count, 2)
+
+        self.run_on_day(5)
+        self.assertEqual(self.notify.call_count, 2)
+
+    def test_success_clears_the_failure(self):
+        self.run_on_day(0)
+        self.run_on_day(3)
+        self.assertTrue(self.saved()["failure_told"])
+
+        self.read_host.side_effect = None
+
+        self.assertEqual(self.run_on_day(4), 0)
+        self.assertIsNone(self.saved()["failed_since"])
+        self.assertFalse(self.saved()["failure_told"])
+
+    def test_a_partly_failed_run_counts_as_failed_and_keeps_what_it_told(self):
+        self.read_host.side_effect = None
+        self.down.add(PSA_URL)
+
+        self.assertEqual(self.run_on_day(0), 1)
+        self.assertEqual(self.saved()["failed_since"], "2026-11-02")
+        self.assertIn("DSA-6600-1", self.saved()["told"])
+
+
+class StateTests(OfflineTests):
+
+    DEFAULTS = {"told": {}, "scores": {}, "failed_since": None, "failure_told": False}
+
+    def test_no_file_gives_defaults(self):
+        self.assertEqual(load_state(), self.DEFAULTS)
+
+    def test_a_bad_file_gives_defaults(self):
+        for text in ('{"told": {"DS', "", "[]", "null"):
+            with self.subTest(text):
+                self.state_file.write_text(text)
+                self.assertEqual(load_state(), self.DEFAULTS)
+
+    def test_a_file_from_before_failure_told_gets_the_default(self):
+        self.state_file.write_text('{"told": {"DSA-1-1": "2026-11-01"}}')
+        state = load_state()
+
+        self.assertEqual(state["told"], {"DSA-1-1": "2026-11-01"})
+        self.assertFalse(state["failure_told"])
+
+    def test_a_bad_file_does_not_stop_a_run(self):
+        self.state_file.write_text('{"told": {"DS')
+        self.read_host.side_effect = None
+
+        self.assertEqual(main(TODAY), 0)
+        self.assertIn("DSA-6600-1", self.saved()["told"])
+
+    def test_saving_replaces_the_file_and_leaves_no_temporary_one(self):
+        self.state_file.write_text("old")
+
+        save_state({"told": {"DSA-1-1": "2026-11-01"}})
+
+        self.assertEqual(self.saved(), {"told": {"DSA-1-1": "2026-11-01"}})
+        self.assertEqual(list(self.folder.iterdir()), [self.state_file])
 
 
 if __name__ == "__main__":

@@ -90,6 +90,9 @@ def parse_debian_advisories(text: str, release: str) -> list:
         if fix and fix.group(1) == release:
             advisories.append({**current, "source": fix.group(2), "version": fix.group(3)})
 
+    if not advisories:
+        raise RuntimeError(f"Debian's advisory list has nothing for {release}")
+
     return advisories
 
 
@@ -258,8 +261,21 @@ def wanted_scores(debian: list, proxmox: list, known: dict, exploited: set) -> l
     return sorted(cve for cve in cves if cve not in known and cve not in exploited)
 
 
+def read_env(text: str) -> dict:
+    """The watchdog's .env, read as compose reads it: values may be quoted."""
+    env = {}
+
+    for line in text.splitlines():
+        name, separator, value = line.strip().partition("=")
+
+        if separator and not name.startswith("#"):
+            env[name.strip()] = value.strip().strip("\"'")
+
+    return env
+
+
 def notify(message: str) -> None:
-    env = dict(line.split("=", 1) for line in ENV_FILE.read_text().splitlines() if "=" in line)
+    env = read_env(ENV_FILE.read_text())
     service = env.get("HA_NOTIFY_SERVICE", "mobile_app_robins_oneplus_13")
     base = env.get("HA_BASE_URL", "http://192.168.1.10:8123")
 
@@ -272,30 +288,79 @@ def notify(message: str) -> None:
 
 
 def load_state() -> dict:
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
-    return {"told": {}, "scores": {}, "failed_since": None, **state}
+    defaults = {"told": {}, "scores": {}, "failed_since": None, "failure_told": False}
+
+    try:
+        state = json.loads(STATE.read_text()) if STATE.exists() else {}
+        return {**defaults, **state}
+
+    except (ValueError, TypeError) as error:
+        print(f"update-alert: ignoring a bad state file: {error}", file=sys.stderr)
+        return defaults
+
+
+def save_state(state: dict) -> None:
+    temporary = STATE.with_name(STATE.name + ".tmp")
+    temporary.write_text(json.dumps(state, indent=1))
+    os.replace(temporary, STATE)
 
 
 def latest_proxmox_advisories() -> list:
+    """The thread's last two pages, so a page rollover doesn't drop an advisory still open.
+
+    Not all pages: an old post that can't be parsed would count as open.
+    """
     first = fetch(PSA_URL)
-    pages = [int(number) for number in re.findall(r"page-(\d+)", first)]
+    last = max((int(number) for number in re.findall(r"page-(\d+)", first)), default=1)
+    advisories = []
 
-    return parse_proxmox_advisories(fetch(f"{PSA_URL}page-{max(pages)}") if pages else first)
+    for number in range(max(last - 1, 1), last + 1):
+        page = first if number == 1 else fetch(f"{PSA_URL}page-{number}")
+
+        # No PSA is fine, a last page may hold only replies; no posts at all is an error page
+        if 'class="bbWrapper"' not in page:
+            raise RuntimeError(f"page {number} of Proxmox's advisory thread has no posts")
+
+        advisories += parse_proxmox_advisories(page)
+
+    return advisories
 
 
-def check(state: dict, today: date) -> None:
+def read_host() -> dict:
     report = subprocess.run(REPORT_COMMAND, capture_output=True, text=True, timeout=600, check=True).stdout
     host = parse_report(report)
 
     if not host["installed"] or not host["release"]:
         raise RuntimeError("the host's report is empty")
 
-    exploited = {item["cveID"] for item in json.loads(fetch(KEV_URL))["vulnerabilities"]}
-    debian = pending_debian_advisories(parse_debian_advisories(fetch(DSA_URL), host["release"]), host)
-    proxmox = [advisory for advisory in latest_proxmox_advisories() if advisory_is_open(advisory, host)]
+    return host
 
+
+def read_source(name: str, fallback, failed: list, read):
+    """What read() returns; if it fails, the fallback, with the name added to failed."""
+    try:
+        return read()
+
+    except Exception as error:
+        print(f"update-alert: {name} failed: {error}", file=sys.stderr)
+        failed.append(name)
+        return fallback
+
+
+def check(state: dict, today: date) -> None:
+    host = read_host()
+    failed = []
+
+    exploited = read_source("CISA's exploited list", set(), failed,
+                            lambda: {item["cveID"] for item in json.loads(fetch(KEV_URL))["vulnerabilities"]})
+    debian = read_source("Debian's advisories", [], failed,
+                         lambda: pending_debian_advisories(parse_debian_advisories(fetch(DSA_URL), host["release"]), host))
+    proxmox = read_source("Proxmox's forum", [], failed,
+                          lambda: [advisory for advisory in latest_proxmox_advisories() if advisory_is_open(advisory, host)])
+
+    # Not given up after one failure: CVEs go in sorted order, so one bad CVE would block those after it for good
     for cve in wanted_scores(debian, proxmox, state["scores"], exploited):
-        cvss = lookup_cvss(cve)
+        cvss = read_source(f"NVD for {cve}", None, failed, lambda: lookup_cvss(cve))
 
         if cvss:
             state["scores"][cve] = cvss
@@ -304,22 +369,30 @@ def check(state: dict, today: date) -> None:
     due = to_tell(problems, state["told"], today)
 
     print(f"{today}: {len(host['pending'])} pending, {len(debian)} Debian and {len(proxmox)} Proxmox "
-          f"advisories open, {len(problems)} worth telling, {len(due)} told now")
+          f"advisories open, {len(problems)} worth telling, {min(len(due), MAX_LINES)} told now")
 
     if due:
         notify(format_message(due))
 
-    state["told"] = {key: seen for key, seen in state["told"].items() if key in problems}
-    state["told"].update({key: today.isoformat() for key, _ in due})
+    # After a failed source problems is incomplete: pruning would lose reminders and cause repeats
+    if not failed:
+        state["told"] = {key: seen for key, seen in state["told"].items() if key in problems}
+
+    # Only what the message showed; the rest come up the next day
+    state["told"].update({key: today.isoformat() for key, _ in due[:MAX_LINES]})
+
+    if failed:
+        raise RuntimeError(f"could not read {', '.join(failed)}")
 
 
-def main() -> int:
+def main(today: date | None = None) -> int:
     state = load_state()
-    today = date.today()
+    today = today or date.today()
 
     try:
         check(state, today)
         state["failed_since"] = None
+        state["failure_told"] = False
         result = 0
 
     except Exception as error:
@@ -327,12 +400,17 @@ def main() -> int:
         state["failed_since"] = state["failed_since"] or today.isoformat()
         failed_days = (today - date.fromisoformat(state["failed_since"])).days
 
-        if failed_days == FAILED_DAYS_BEFORE_TELLING:
-            notify(f"The update check has failed for {failed_days} days: {error}")
+        if failed_days >= FAILED_DAYS_BEFORE_TELLING and not state["failure_told"]:
+            try:
+                notify(f"The update check has failed for {failed_days} days: {error}")
+                state["failure_told"] = True
+
+            except Exception as notify_error:
+                print(f"update-alert could not tell: {notify_error}", file=sys.stderr)
 
         result = 1
 
-    STATE.write_text(json.dumps(state, indent=1))
+    save_state(state)
     return result
 
 

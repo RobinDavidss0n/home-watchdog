@@ -15,6 +15,7 @@ type Fake = {
   jobs: "idle" | "busy" | "agent-down";
   rebootWorks: boolean;
   rebootFixes: boolean;
+  rebootHealsAfterMs: number | null;
   resetWorks: boolean;
   calls: string[];
   notifications: string[];
@@ -27,6 +28,7 @@ const startFake = async (overrides: Partial<Fake>) => {
     jobs: "idle",
     rebootWorks: true,
     rebootFixes: true,
+    rebootHealsAfterMs: null,
     resetWorks: true,
     calls: [],
     notifications: [],
@@ -58,6 +60,7 @@ const startFake = async (overrides: Partial<Fake>) => {
       fake.calls.push("reboot");
       if (!fake.rebootWorks) return json(500, null);
       if (fake.rebootFixes) fake.healthy = true;
+      if (fake.rebootHealsAfterMs !== null) setTimeout(() => { fake.healthy = true; }, fake.rebootHealsAfterMs);
       json(200, "UPID");
 
     } else if (url.endsWith("/status/reset")) {
@@ -104,6 +107,8 @@ const runWatchdog = async (
     "ha-watchdog-test", "npx", "tsx", "src/main.ts"
   ], { stdio: "ignore" });
 
+  const exited = new Promise(resolve => container.on("exit", resolve));
+
   onStart?.(fake);
 
   const deadline = Date.now() + maxSeconds * 1000;
@@ -114,10 +119,15 @@ const runWatchdog = async (
   // Long enough to catch a wrong extra call right after the expected one
   await new Promise(resolve => setTimeout(resolve, 3000));
 
-  await new Promise(resolve => {
-    container.on("exit", resolve);
-    spawn("docker", ["kill", name], { stdio: "ignore" });
-  });
+  if (container.exitCode !== null) {
+    server.closeAllConnections();
+    server.close();
+
+    throw new Error(`Container exited early with code ${container.exitCode}. The image may need building: docker build --target development -t ha-watchdog-test .`);
+  }
+
+  spawn("docker", ["kill", name], { stdio: "ignore" });
+  await exited;
 
   server.closeAllConnections();
   server.close();
@@ -125,7 +135,7 @@ const runWatchdog = async (
   return fake;
 };
 
-describe("recovery", { concurrency: true }, () => {
+describe("recovery", { concurrency: 3 }, () => {
 
   test("healthy HA is left alone", async () => {
     const fake = await runWatchdog({}, () => false, 30);
@@ -186,5 +196,40 @@ describe("recovery", { concurrency: true }, () => {
 
     assert.deepEqual(fake.calls, ["reboot", "reset"]);
     assert.deepEqual(fake.notifications, ["HA Watchdog: Home Assistant is unhealthy and could not be restarted :("]);
+  });
+
+  test("a slow boot after a reboot is not power-cut", async () => {
+    const fake = await runWatchdog({ healthy: false, jobs: "agent-down", rebootFixes: false, rebootHealsAfterMs: 95 * 1000 }, f => f.notifications.length > 0, 300);
+
+    assert.deepEqual(fake.calls, ["reboot"]);
+    assert.deepEqual(fake.notifications, ["HA Watchdog: Home Assistant was restarted (reboot) and has recovered successfully :)"]);
+  });
+
+  test("a failed restart is told once, and so is recovering by itself", async () => {
+    const healsAfterTheFirstMessage = (fake: Fake) => {
+      let toldAt: number | null = null;
+
+      const interval = setInterval(() => {
+
+        if (fake.notifications.length !== 1) return;
+
+        toldAt ??= Date.now();
+
+        if (35 * 1000 > Date.now() - toldAt) return;
+
+        fake.healthy = true;
+        clearInterval(interval);
+      }, 500);
+
+      // A container that exits early must not leave this holding the test run open
+      interval.unref();
+    };
+
+    const fake = await runWatchdog({ healthy: false, rebootWorks: false, resetWorks: false }, f => f.notifications.length >= 2, 240, healsAfterTheFirstMessage);
+
+    assert.deepEqual(fake.notifications, [
+      "HA Watchdog: Home Assistant is unhealthy and could not be restarted :(",
+      "HA Watchdog: Home Assistant is healthy again without a restart :)"
+    ]);
   });
 });

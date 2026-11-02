@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { env } from "../src/env.js";
 import { parseActiveJobs } from "../src/ha-jobs.js";
-import { createRecovery, decideOnFailedCheck, markHealthy } from "../src/recovery.js";
+import { createRecovery, decideOnFailedCheck, markHealthy, markRestarted } from "../src/recovery.js";
 
 const MINUTE = 60 * 1000;
 
@@ -56,6 +56,49 @@ test("the limit runs from the start of the outage, not from the latest job", () 
 
   decideOnFailedCheck(recovery, "busy", 0);
   assert.equal(decideOnFailedCheck(recovery, "unknown", limit), "wait");
+});
+
+test("a restart starts a new window, and the next step is still a reset", () => {
+  const recovery = createRecovery();
+  const later = 1000 * MINUTE;
+  const pastLimit = later + env.BUSY_JOBS_MAX_DEFER_MINUTES * MINUTE;
+
+  for (let i = 0; i < 3; i++) decideOnFailedCheck(recovery, "idle", i);
+  markRestarted(recovery);
+
+  assert.equal(recovery.rebootTried, true);
+  assert.equal(decideOnFailedCheck(recovery, "busy", later), "defer");
+  assert.equal(decideOnFailedCheck(recovery, "unknown", later + 1), "defer");
+
+  assert.equal(decideOnFailedCheck(recovery, "busy", pastLimit), "wait");
+  assert.equal(decideOnFailedCheck(recovery, "busy", pastLimit + 1), "wait");
+  assert.equal(decideOnFailedCheck(recovery, "busy", pastLimit + 2), "reset");
+});
+
+test("a busy defer clears unknown failures, so scattered unknowns don't add up", () => {
+  const recovery = createRecovery();
+  const limit = env.UNKNOWN_JOBS_MAX_DEFER_MINUTES * MINUTE;
+
+  decideOnFailedCheck(recovery, "unknown", 0);
+  assert.equal(decideOnFailedCheck(recovery, "unknown", limit), "wait");
+  assert.equal(decideOnFailedCheck(recovery, "unknown", limit + 1), "wait");
+  assert.equal(recovery.activeFails, 2);
+
+  assert.equal(decideOnFailedCheck(recovery, "busy", limit + 2), "defer");
+  assert.equal(recovery.activeFails, 0);
+
+  assert.equal(decideOnFailedCheck(recovery, "unknown", limit + 3), "wait");
+  assert.equal(recovery.activeFails, 1);
+});
+
+test("a consecutive run of unknowns past the limit still reaches a reboot", () => {
+  const recovery = createRecovery();
+  const limit = env.UNKNOWN_JOBS_MAX_DEFER_MINUTES * MINUTE;
+
+  decideOnFailedCheck(recovery, "unknown", 0);
+  assert.equal(decideOnFailedCheck(recovery, "unknown", limit), "wait");
+  assert.equal(decideOnFailedCheck(recovery, "unknown", limit + 1), "wait");
+  assert.equal(decideOnFailedCheck(recovery, "unknown", limit + 2), "reboot");
 });
 
 test("a healthy check clears everything", () => {

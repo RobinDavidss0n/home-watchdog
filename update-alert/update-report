@@ -7,7 +7,9 @@ echo "RELEASE $VERSION_CODENAME"
 echo "KERNEL $(uname -r)"
 dpkg-query -W -f 'INSTALLED ${Package} ${Version}\n'
 
-apt list --upgradable 2>/dev/null | sed -n 's/^\([^/]*\)\/[^ ]* \([^ ]*\) [^ ]* \[upgradable from: \(.*\)\]$/\1 \2 \3/p' |
+upgradable=$(apt list --upgradable 2>/dev/null) || exit 1
+
+printf '%s\n' "$upgradable" | sed -n 's/^\([^/]*\)\/[^ ]* \([^ ]*\) [^ ]* \[upgradable from: \(.*\)\]$/\1 \2 \3/p' |
 while read -r package new old; do
   echo "PENDING $package $old $new $(dpkg-query -W -f '${source:Package}' "$package" | head -1)"
 done

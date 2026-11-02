@@ -3,7 +3,7 @@ import { env } from "./env.js";
 import { logger } from "./logger.js";
 import { rebootHaVm, resetHaVm } from "./proxmox.js";
 import { getJobsState } from "./ha-jobs.js";
-import { createRecovery, decideOnFailedCheck, markHealthy } from "./recovery.js";
+import { createRecovery, decideOnFailedCheck, markHealthy, markRestarted } from "./recovery.js";
 import dayjs from "dayjs";
 import { sendHaNotification } from "./ha-notifications.js";
 
@@ -14,6 +14,7 @@ async function run() {
   const recovery = createRecovery();
   let isUnhealthy = false;
   let justRestarted: "reboot" | "reset" | null = null;
+  let restartFailedTold = false;
   let simulatedFails = env.SIMULATE_UI_FAILS;
   let lastHeartbeat = Date.now();
   
@@ -80,6 +81,11 @@ async function run() {
           if (justRestarted) {
             await sendHaNotification(`HA Watchdog: Home Assistant was restarted (${justRestarted}) and has recovered successfully :)`);
             justRestarted = null;
+            restartFailedTold = false;
+
+          } else if (restartFailedTold) {
+            await sendHaNotification("HA Watchdog: Home Assistant is healthy again without a restart :)");
+            restartFailedTold = false;
           }
 
           if (Date.now() - lastHeartbeat >= env.HEARTBEAT_MINUTES * 60 * 1000) {
@@ -127,7 +133,9 @@ async function run() {
 
             if (rebooted || reset) {
 
+              markRestarted(recovery);
               justRestarted = rebooted ? "reboot" : "reset";
+              restartFailedTold = false;
 
               logger.info(module, `Waiting ${env.WAIT_AFTER_RESTART_MINUTES} minutes for VM to restart before continuing...`);
               await new Promise(resolve => setTimeout(resolve, env.WAIT_AFTER_RESTART_MINUTES * 60 * 1000));
@@ -135,7 +143,9 @@ async function run() {
               break; // Exit loop after triggering restart, reinitializing browser
             }
 
-            await sendHaNotification("HA Watchdog: Home Assistant is unhealthy and could not be restarted :(");
+            // Only a message that got out counts: HA may be down too, so it's tried again next round
+            if (!restartFailedTold)
+              restartFailedTold = await sendHaNotification("HA Watchdog: Home Assistant is unhealthy and could not be restarted :(");
           }
           
         }

@@ -21,6 +21,12 @@ export const markHealthy = (recovery: Recovery) => {
   recovery.rebootTried = false;
 };
 
+/** Each restart gets its own outage window, rebootTried stays so the next step is still a reset */
+export const markRestarted = (recovery: Recovery) => {
+  recovery.activeFails = 0;
+  recovery.unhealthySince = null;
+};
+
 const deferLimitMinutes = (jobs: JobsState): number =>
   jobs === "busy" ? env.BUSY_JOBS_MAX_DEFER_MINUTES : env.UNKNOWN_JOBS_MAX_DEFER_MINUTES;
 
@@ -33,8 +39,13 @@ export const decideOnFailedCheck = (recovery: Recovery, jobs: JobsState, now: nu
 
     const unhealthyMinutes = (now - recovery.unhealthySince) / (60 * 1000);
 
-    if (deferLimitMinutes(jobs) > unhealthyMinutes)
+    if (deferLimitMinutes(jobs) > unhealthyMinutes) {
+
+      if (jobs === "busy")
+        recovery.activeFails = 0;
+
       return "defer";
+    }
   }
 
   recovery.activeFails++;
