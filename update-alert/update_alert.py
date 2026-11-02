@@ -122,14 +122,14 @@ def parse_proxmox_advisories(page: str) -> list:
             continue
 
         fixed_part = text.split("Fixed in:", 1)[-1] if "Fixed in:" in text else ""
-        fixed_part = re.split(r"References:|Details:", fixed_part)[0]
+        fixed_part = re.sub(r"\([^)]*\)", "", re.split(r"References:|Details:", fixed_part)[0])
 
         advisories.append({
             "id": subject.group(1),
             "title": subject.group(2).replace("​", "").strip(),
             "cves": sorted(set(re.findall(r"CVE-\d{4}-\d+", text))),
             "no_login": any(word in text.lower() for word in NO_LOGIN_WORDS),
-            "fixed": re.findall(r"([a-z0-9][a-z0-9.+-]*)(?:\(-signed\))?(?:\s*>=\s*|\s+)(\d[\w.:+~-]*)", fixed_part),
+            "fixed": re.findall(r"([a-z0-9][a-z0-9.+-]*)(?:\s*>=\s*|\s+)(\d[\w.:+~-]*)", fixed_part),
             "kernels": re.findall(r"proxmox-kernel-(\d[\w.]*-\d+)-pve", fixed_part),
         })
 
